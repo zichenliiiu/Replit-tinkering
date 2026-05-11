@@ -246,33 +246,71 @@ async function getValues(sheetName: string): Promise<string[][]> {
   return d.values ?? [];
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function safeJson<T>(resp: Response, label: string): Promise<T> {
+  const text = await resp.text();
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    // Likely a rate-limit HTML page — surface a useful error
+    throw new Error(`${label}: non-JSON response (status ${resp.status}) — ${text.slice(0, 200)}`);
+  }
+}
+
 async function batchUpdateSheet(requests: BatchRequest[]): Promise<BatchUpdateResponse> {
-  const resp = await connectors.proxy(
-    "google-sheet",
-    `/v4/spreadsheets/${SPREADSHEET_ID}:batchUpdate`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requests }),
+  const MAX_RETRIES = 5;
+  let delay = 3000;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const resp = await connectors.proxy(
+      "google-sheet",
+      `/v4/spreadsheets/${SPREADSHEET_ID}:batchUpdate`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ requests }),
+      }
+    );
+    if (resp.status === 429 || resp.status === 503) {
+      if (attempt === MAX_RETRIES) throw new Error(`batchUpdate: rate limited after ${MAX_RETRIES} retries`);
+      console.warn(`  ⏳ Rate limited (${resp.status}) — retrying in ${delay / 1000}s…`);
+      await sleep(delay);
+      delay *= 2;
+      continue;
     }
-  );
-  const d = (await resp.json()) as BatchUpdateResponse;
-  if (d.error) throw new Error(`batchUpdate failed: ${JSON.stringify(d.error)}`);
-  return d;
+    const d = await safeJson<BatchUpdateResponse>(resp, "batchUpdate");
+    if (d.error) throw new Error(`batchUpdate failed: ${JSON.stringify(d.error)}`);
+    return d;
+  }
+  throw new Error("batchUpdate: exhausted retries");
 }
 
 async function writeValues(range: string, values: (string | number)[][]): Promise<void> {
-  const resp = await connectors.proxy(
-    "google-sheet",
-    `/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`,
-    {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ range, values }),
+  const MAX_RETRIES = 5;
+  let delay = 3000;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const resp = await connectors.proxy(
+      "google-sheet",
+      `/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ range, values }),
+      }
+    );
+    if (resp.status === 429 || resp.status === 503) {
+      if (attempt === MAX_RETRIES) throw new Error(`writeValues: rate limited after ${MAX_RETRIES} retries`);
+      console.warn(`  ⏳ Rate limited (${resp.status}) — retrying in ${delay / 1000}s…`);
+      await sleep(delay);
+      delay *= 2;
+      continue;
     }
-  );
-  const d = (await resp.json()) as ValuesResponse;
-  if (d.error) throw new Error(`writeValues(${range}): ${JSON.stringify(d.error)}`);
+    const d = await safeJson<ValuesResponse>(resp, `writeValues(${range})`);
+    if (d.error) throw new Error(`writeValues(${range}): ${JSON.stringify(d.error)}`);
+    return;
+  }
 }
 
 // ── Aggregate helpers ─────────────────────────────────────────────────────
@@ -700,6 +738,361 @@ function pieChart(title: string, p: ChartPlacement): AddChartRequest {
       },
     },
   };
+}
+
+// ── Forecast Tab ──────────────────────────────────────────────────────────
+//
+// Structure:
+//  • Assumption blocks (highlighted yellow) — prices, switch rates, expansion rates
+//  • Current user base — live SUMIF from source sheets
+//  • Expansion pool — SL from data, PLG estimated via coverage ratio
+//  • Scenario results — Conservative / Base / Aggressive for switch + expansion ARR
+//  • Sensitivity table — Net New ARR across price × SL adoption rate grid
+
+async function buildForecastTab(_plgRows: string[][], _slRows: string[][]): Promise<void> {
+  console.log("\nBuilding Forecast tab...");
+  const forecastSheetId = await getOrCreateSheet("Forecast", 2);
+
+  type FRow = (string | number)[];
+  const grid: FRow[] = [];
+  const yellowCells: Array<[number, number, number, number]> = []; // 0-based [sr,er,sc,ec]
+  const pctCells:    Array<[number, number, number, number]> = [];
+
+  function addRow(cols: FRow = []): void { grid.push(cols); }
+  function markYellow(sc: number, ec: number): void {
+    yellowCells.push([grid.length - 1, grid.length, sc, ec]);
+  }
+  function markPct(sc: number, ec: number): void {
+    pctCells.push([grid.length - 1, grid.length, sc, ec]);
+  }
+
+  // ── Title ─────────────────────────────────────────────────────────────
+  addRow(["MARKETING LICENSE — REVENUE FORECAST MODEL"]);
+  addRow([]);
+
+  // ── PRICE ASSUMPTIONS ─────────────────────────────────────────────────
+  addRow(["LICENSE PRICE ASSUMPTIONS  —  edit highlighted cells"]);
+  addRow(["Parameter", "Value ($/user/month)", "Notes"]);
+  const priceHdrIdx = grid.length; // 0-indexed; sheet row = idx+1
+  addRow(["Marketing License (new)", 20, "Your key pricing lever — the new SKU"]);
+  markYellow(1, 2);
+  addRow(["Full Seat (current)", 45, "Update to your actual pricing"]);
+  markYellow(1, 2);
+  addRow(["Dev Seat (current)", 35, "Update to your actual pricing"]);
+  markYellow(1, 2);
+  addRow(["Collab Seat (current)", 15, "Update to your actual pricing"]);
+  markYellow(1, 2);
+  addRow(["Viewer Seat (current)", 5, "Update to your actual pricing"]);
+  markYellow(1, 2);
+  addRow([]);
+
+  // 1-based sheet row refs for price cells (col B)
+  const mktgPriceSR   = priceHdrIdx + 1; // sheet row of Marketing License price
+  const fullPriceSR   = priceHdrIdx + 2;
+  const devPriceSR    = priceHdrIdx + 3;
+  const collabPriceSR = priceHdrIdx + 4;
+  const viewerPriceSR = priceHdrIdx + 5;
+
+  // ── SWITCH RATE ASSUMPTIONS ───────────────────────────────────────────
+  addRow(["SWITCH RATE ASSUMPTIONS  —  % of current mktg users on each seat who switch to the new license"]);
+  addRow(["Seat Type", "Conservative", "Base", "Aggressive", "Rationale"]);
+  const switchHdrIdx = grid.length;
+  addRow(["Full → Marketing",   0.10, 0.20, 0.35, "Mktg license cheaper → strong financial incentive to switch"]);
+  markYellow(1, 4); markPct(1, 4);
+  addRow(["Dev → Marketing",    0.08, 0.15, 0.25, "Cheaper alternative for dev-seat marketers"]);
+  markYellow(1, 4); markPct(1, 4);
+  addRow(["Collab → Marketing", 0.05, 0.10, 0.20, "Mktg license pricier → only upgrade for mktg-specific features"]);
+  markYellow(1, 4); markPct(1, 4);
+  addRow(["Viewer → Marketing", 0.02, 0.05, 0.10, "Mktg license much pricier → only highly engaged viewers upgrade"]);
+  markYellow(1, 4); markPct(1, 4);
+  addRow([]);
+
+  const fullSwitchSR   = switchHdrIdx + 1; // sheet rows for switch rate rows
+  const devSwitchSR    = switchHdrIdx + 2;
+  const collabSwitchSR = switchHdrIdx + 3;
+  const viewerSwitchSR = switchHdrIdx + 4;
+
+  // ── EXPANSION ASSUMPTIONS ─────────────────────────────────────────────
+  addRow(["EXPANSION ASSUMPTIONS  —  unadopted marketing employees who sign up for the new license"]);
+  addRow(["Parameter", "Conservative", "Base", "Aggressive", "Notes"]);
+  const expHdrIdx = grid.length;
+  addRow(["SL: Expansion Adoption Rate", 0.05, 0.15, 0.25,
+    "% of unadopted SL mktg employees (Marketing Count − current users) who sign up"]);
+  markYellow(1, 4); markPct(1, 4);
+  addRow(["PLG: Mktg Coverage Ratio", 0.30, 0.20, 0.15,
+    "Assumed % of total mktg employees at PLG companies already in product"]);
+  markYellow(1, 4); markPct(1, 4);
+  addRow(["PLG: Expansion Adoption Rate", 0.05, 0.12, 0.20,
+    "% of unadopted PLG mktg employees who sign up"]);
+  markYellow(1, 4); markPct(1, 4);
+  addRow([]);
+
+  const slExpSR       = expHdrIdx + 1;
+  const plgCoverageSR = expHdrIdx + 2;
+  const plgExpSR      = expHdrIdx + 3;
+
+  // ── CURRENT MARKETING USER BASE ───────────────────────────────────────
+  addRow(["CURRENT MARKETING USER BASE  —  live from source data"]);
+  addRow(["Motion", "Full", "Dev", "Collab", "Viewer", "Total Mktg Users"]);
+  const dataHdrIdx = grid.length;
+  const plgDataSR  = dataHdrIdx + 1;
+  const slDataSR   = dataHdrIdx + 2;
+
+  addRow(["PLG",
+    "=SUM(PLG!I:I)", "=SUM(PLG!J:J)", "=SUM(PLG!K:K)", "=SUM(PLG!L:L)",
+    `=B${plgDataSR}+C${plgDataSR}+D${plgDataSR}+E${plgDataSR}`,
+  ]);
+  addRow(["Sales-Led",
+    "=SUM('Sales-Led'!R:R)", "=SUM('Sales-Led'!S:S)",
+    "=SUM('Sales-Led'!T:T)", "=SUM('Sales-Led'!U:U)",
+    `=B${slDataSR}+C${slDataSR}+D${slDataSR}+E${slDataSR}`,
+  ]);
+  addRow(["Combined",
+    `=B${plgDataSR}+B${slDataSR}`, `=C${plgDataSR}+C${slDataSR}`,
+    `=D${plgDataSR}+D${slDataSR}`, `=E${plgDataSR}+E${slDataSR}`,
+    `=F${plgDataSR}+F${slDataSR}`,
+  ]);
+  addRow([]);
+
+  // ── EXPANSION POOL ────────────────────────────────────────────────────
+  addRow(["EXPANSION POOL  —  est. marketing employees not yet using the product"]);
+  addRow(["Motion", "Est. Total Mktg Employees", "Current Mktg Users", "Unadopted Pool", "Notes"]);
+  const poolHdrIdx = grid.length;
+  const slPoolSR   = poolHdrIdx + 1;
+  const plgPoolSR  = poolHdrIdx + 2;
+
+  addRow(["Sales-Led",
+    "=SUM('Sales-Led'!L:L)",
+    `=F${slDataSR}`,
+    `=B${slPoolSR}-C${slPoolSR}`,
+    "From data: Marketing Count (employees at company)",
+  ]);
+  addRow(["PLG (Base estimate)",
+    `=ROUND(F${plgDataSR}/C${plgCoverageSR},0)`,
+    `=F${plgDataSR}`,
+    `=B${plgPoolSR}-C${plgPoolSR}`,
+    "Estimated: current mktg users ÷ Base coverage ratio",
+  ]);
+  addRow(["Combined",
+    `=B${slPoolSR}+B${plgPoolSR}`,
+    `=C${slPoolSR}+C${plgPoolSR}`,
+    `=D${slPoolSR}+D${plgPoolSR}`, "",
+  ]);
+  addRow([]);
+
+  // ── SCENARIO RESULTS ──────────────────────────────────────────────────
+  addRow(["SCENARIO RESULTS  —  annual revenue impact of launching the Marketing license"]);
+  addRow(["Revenue Component", "Conservative", "Base", "Aggressive"]);
+
+  addRow(["SWITCH EFFECT  (revenue delta from existing mktg users switching seats)"]);
+  const fullSwIdx   = grid.length;
+  addRow(["Full → Marketing",
+    `=(B${plgDataSR}+B${slDataSR})*B${fullSwitchSR}*(B${mktgPriceSR}-B${fullPriceSR})*12`,
+    `=(B${plgDataSR}+B${slDataSR})*C${fullSwitchSR}*(B${mktgPriceSR}-B${fullPriceSR})*12`,
+    `=(B${plgDataSR}+B${slDataSR})*D${fullSwitchSR}*(B${mktgPriceSR}-B${fullPriceSR})*12`,
+  ]);
+  const devSwIdx    = grid.length;
+  addRow(["Dev → Marketing",
+    `=(C${plgDataSR}+C${slDataSR})*B${devSwitchSR}*(B${mktgPriceSR}-B${devPriceSR})*12`,
+    `=(C${plgDataSR}+C${slDataSR})*C${devSwitchSR}*(B${mktgPriceSR}-B${devPriceSR})*12`,
+    `=(C${plgDataSR}+C${slDataSR})*D${devSwitchSR}*(B${mktgPriceSR}-B${devPriceSR})*12`,
+  ]);
+  const collabSwIdx = grid.length;
+  addRow(["Collab → Marketing",
+    `=(D${plgDataSR}+D${slDataSR})*B${collabSwitchSR}*(B${mktgPriceSR}-B${collabPriceSR})*12`,
+    `=(D${plgDataSR}+D${slDataSR})*C${collabSwitchSR}*(B${mktgPriceSR}-B${collabPriceSR})*12`,
+    `=(D${plgDataSR}+D${slDataSR})*D${collabSwitchSR}*(B${mktgPriceSR}-B${collabPriceSR})*12`,
+  ]);
+  const viewerSwIdx = grid.length;
+  addRow(["Viewer → Marketing",
+    `=(E${plgDataSR}+E${slDataSR})*B${viewerSwitchSR}*(B${mktgPriceSR}-B${viewerPriceSR})*12`,
+    `=(E${plgDataSR}+E${slDataSR})*C${viewerSwitchSR}*(B${mktgPriceSR}-B${viewerPriceSR})*12`,
+    `=(E${plgDataSR}+E${slDataSR})*D${viewerSwitchSR}*(B${mktgPriceSR}-B${viewerPriceSR})*12`,
+  ]);
+  addRow(["Total Switch Effect",
+    `=SUM(B${fullSwIdx+1}:B${viewerSwIdx+1})`,
+    `=SUM(C${fullSwIdx+1}:C${viewerSwIdx+1})`,
+    `=SUM(D${fullSwIdx+1}:D${viewerSwIdx+1})`,
+  ]);
+  const totalSwitchSR = grid.length; // 1-based sheet row of Total Switch row
+
+  addRow([]);
+  addRow(["EXPANSION EFFECT  (revenue from new marketing employees signing up)"]);
+  const slExpRevIdx  = grid.length;
+  addRow(["Sales-Led new sign-ups",
+    `=D${slPoolSR}*B${slExpSR}*B${mktgPriceSR}*12`,
+    `=D${slPoolSR}*C${slExpSR}*B${mktgPriceSR}*12`,
+    `=D${slPoolSR}*D${slExpSR}*B${mktgPriceSR}*12`,
+  ]);
+  const plgExpRevIdx = grid.length;
+  addRow(["PLG new sign-ups (est.)",
+    `=(ROUND(F${plgDataSR}/B${plgCoverageSR},0)-F${plgDataSR})*B${plgExpSR}*B${mktgPriceSR}*12`,
+    `=(ROUND(F${plgDataSR}/C${plgCoverageSR},0)-F${plgDataSR})*C${plgExpSR}*B${mktgPriceSR}*12`,
+    `=(ROUND(F${plgDataSR}/D${plgCoverageSR},0)-F${plgDataSR})*D${plgExpSR}*B${mktgPriceSR}*12`,
+  ]);
+  addRow(["Total Expansion Effect",
+    `=SUM(B${slExpRevIdx+1}:B${plgExpRevIdx+1})`,
+    `=SUM(C${slExpRevIdx+1}:C${plgExpRevIdx+1})`,
+    `=SUM(D${slExpRevIdx+1}:D${plgExpRevIdx+1})`,
+  ]);
+  const totalExpSR = grid.length;
+
+  addRow([]);
+  addRow(["NET NEW ARR  (Switch Effect + Expansion Effect)",
+    `=B${totalSwitchSR}+B${totalExpSR}`,
+    `=C${totalSwitchSR}+C${totalExpSR}`,
+    `=D${totalSwitchSR}+D${totalExpSR}`,
+  ]);
+  const netArrSR = grid.length;
+
+  addRow([]);
+  addRow(["VOLUME METRICS", "Conservative", "Base", "Aggressive"]);
+  const switchUsersIdx = grid.length;
+  addRow(["Mktg license users (from switches)",
+    `=(B${plgDataSR}+B${slDataSR})*B${fullSwitchSR}+(C${plgDataSR}+C${slDataSR})*B${devSwitchSR}+(D${plgDataSR}+D${slDataSR})*B${collabSwitchSR}+(E${plgDataSR}+E${slDataSR})*B${viewerSwitchSR}`,
+    `=(B${plgDataSR}+B${slDataSR})*C${fullSwitchSR}+(C${plgDataSR}+C${slDataSR})*C${devSwitchSR}+(D${plgDataSR}+D${slDataSR})*C${collabSwitchSR}+(E${plgDataSR}+E${slDataSR})*C${viewerSwitchSR}`,
+    `=(B${plgDataSR}+B${slDataSR})*D${fullSwitchSR}+(C${plgDataSR}+C${slDataSR})*D${devSwitchSR}+(D${plgDataSR}+D${slDataSR})*D${collabSwitchSR}+(E${plgDataSR}+E${slDataSR})*D${viewerSwitchSR}`,
+  ]);
+  const expUsersIdx = grid.length;
+  addRow(["Mktg license users (from expansion)",
+    `=D${slPoolSR}*B${slExpSR}+(ROUND(F${plgDataSR}/B${plgCoverageSR},0)-F${plgDataSR})*B${plgExpSR}`,
+    `=D${slPoolSR}*C${slExpSR}+(ROUND(F${plgDataSR}/C${plgCoverageSR},0)-F${plgDataSR})*C${plgExpSR}`,
+    `=D${slPoolSR}*D${slExpSR}+(ROUND(F${plgDataSR}/D${plgCoverageSR},0)-F${plgDataSR})*D${plgExpSR}`,
+  ]);
+  const totalUsersIdx = grid.length;
+  addRow(["Total Mktg License Users",
+    `=B${switchUsersIdx+1}+B${expUsersIdx+1}`,
+    `=C${switchUsersIdx+1}+C${expUsersIdx+1}`,
+    `=D${switchUsersIdx+1}+D${expUsersIdx+1}`,
+  ]);
+  addRow(["Implied Annual Rev per User",
+    `=IFERROR(B${netArrSR}/B${totalUsersIdx+1},0)`,
+    `=IFERROR(C${netArrSR}/C${totalUsersIdx+1},0)`,
+    `=IFERROR(D${netArrSR}/D${totalUsersIdx+1},0)`,
+  ]);
+  const impliedRevIdx = grid.length - 1;
+  addRow([]);
+
+  // ── SENSITIVITY TABLE ─────────────────────────────────────────────────
+  // Rows = Marketing license price, Cols = SL expansion adoption rate
+  // Fixed: Base switch rates, Base PLG coverage & expansion
+  addRow(["SENSITIVITY: Net New ARR by Marketing License Price × SL Expansion Adoption Rate"]);
+  addRow(["(Base switch rates applied; PLG expansion uses Base coverage ratio and adoption rate)"]);
+  addRow([]);
+  const sensHdrIdx = grid.length;
+  addRow(["Price ↓  /  SL Adoption →", "5%", "10%", "15%", "20%", "25%"]);
+
+  const PRICES    = [10, 15, 20, 25, 30];
+  const ADOPTIONS = [0.05, 0.10, 0.15, 0.20, 0.25];
+  const sensPriceStart = grid.length;
+
+  for (const price of PRICES) {
+    const row: FRow = [`$${price}/user/mo`];
+    for (const adoption of ADOPTIONS) {
+      const switchFml =
+        `(B${plgDataSR}+B${slDataSR})*C${fullSwitchSR}*(${price}-B${fullPriceSR})*12` +
+        `+(C${plgDataSR}+C${slDataSR})*C${devSwitchSR}*(${price}-B${devPriceSR})*12` +
+        `+(D${plgDataSR}+D${slDataSR})*C${collabSwitchSR}*(${price}-B${collabPriceSR})*12` +
+        `+(E${plgDataSR}+E${slDataSR})*C${viewerSwitchSR}*(${price}-B${viewerPriceSR})*12`;
+      const slExpFml  = `D${slPoolSR}*${adoption}*${price}*12`;
+      const plgExpFml = `(ROUND(F${plgDataSR}/C${plgCoverageSR},0)-F${plgDataSR})*C${plgExpSR}*${price}*12`;
+      row.push(`=${switchFml}+${slExpFml}+${plgExpFml}`);
+    }
+    addRow(row);
+  }
+  const sensPriceEnd = grid.length;
+
+  // ── Pad rows and write ────────────────────────────────────────────────
+  const maxCols = 7;
+  for (const row of grid) { while (row.length < maxCols) row.push(""); }
+  console.log(`Writing ${grid.length} rows to Forecast sheet...`);
+  await writeValues("Forecast!A1", grid);
+
+  // ── Formatting ────────────────────────────────────────────────────────
+  console.log("Applying Forecast formatting...");
+
+  // Section headers (0-based grid rows)
+  const sectionRows = [0, 2, 10, 17, 23, 29, 35];
+  // Table headers (0-based)
+  const tableHdrRows = [3, 11, 18, 24, 30, 36, 37, grid.length - (sensPriceEnd - sensHdrIdx) - 3, sensHdrIdx];
+
+  // Infer the subheader rows from the known scenario section
+  // "SWITCH EFFECT" subheader is just after main scenario header row 36
+  const switchSubHdr  = 37; // grid row of "SWITCH EFFECT..." label
+  const expSubHdr     = switchSubHdr + fullSwIdx - 37 + (viewerSwIdx - fullSwIdx) + 2; // computed below
+  // Simple approach: identify by content — just use grid row indices we tracked
+  const totalSwitchIdx = totalSwitchSR - 1; // 0-based
+  const expSubHdrIdx   = totalSwitchIdx + 2; // blank + subheader
+  const totalExpIdx    = totalExpSR - 1;
+  const netArrIdx      = netArrSR - 1;
+  const volHdrIdx      = netArrIdx + 2;
+
+  const formatRequests: BatchRequest[] = [
+    // Title
+    ...sectionHeader(forecastSheetId, 0, 6),
+    { repeatCell: {
+        range: { sheetId: forecastSheetId, startRowIndex: 0, endRowIndex: 1, startColumnIndex: 0, endColumnIndex: 6 },
+        cell: { userEnteredFormat: { textFormat: { bold: true, fontSize: 16, foregroundColor: { red: 1, green: 1, blue: 1 } } } },
+        fields: "userEnteredFormat.textFormat",
+    } } satisfies RepeatCellRequest,
+
+    // Section headers
+    ...sectionRows.flatMap((r) => sectionHeader(forecastSheetId, r, 6)),
+
+    // Table & sub-section headers
+    ...tableHdrRows.flatMap((r) => tableHeader(forecastSheetId, r, 6)),
+    // Subheaders within scenario section
+    ...tableHeader(forecastSheetId, switchSubHdr, 4),
+    ...tableHeader(forecastSheetId, expSubHdrIdx, 4),
+    // NET NEW ARR — bold highlight
+    boldRow(forecastSheetId, netArrIdx, 0, 4),
+    bgRow(forecastSheetId, netArrIdx, 0, 4, 0.95, 0.98, 0.87),
+    // Volume metrics header
+    ...tableHeader(forecastSheetId, volHdrIdx, 4),
+
+    // Column widths
+    columnWidth(forecastSheetId, 0, 280),
+    columnWidth(forecastSheetId, 1, 140),
+    columnWidth(forecastSheetId, 2, 140),
+    columnWidth(forecastSheetId, 3, 140),
+    columnWidth(forecastSheetId, 4, 200),
+    columnWidth(forecastSheetId, 5, 20),
+
+    // Yellow cells (user assumption inputs)
+    ...yellowCells.map(([sr, er, sc, ec]) => ({
+      repeatCell: {
+        range: { sheetId: forecastSheetId, startRowIndex: sr, endRowIndex: er, startColumnIndex: sc, endColumnIndex: ec },
+        cell: { userEnteredFormat: { backgroundColor: { red: 1, green: 0.95, blue: 0.6 } } },
+        fields: "userEnteredFormat.backgroundColor",
+      },
+    } satisfies RepeatCellRequest)),
+
+    // % format for switch rates and expansion assumptions
+    ...pctCells.map(([sr, er, sc, ec]) => numFmtRange(forecastSheetId, sr, er, sc, ec, "0%")),
+
+    // $ format for price assumptions (col B = index 1)
+    numFmtRange(forecastSheetId, priceHdrIdx, priceHdrIdx + 5, 1, 2, `$#,##0.00`),
+
+    // #,##0 for current user counts and pool counts (cols B–F)
+    numFmtRange(forecastSheetId, dataHdrIdx, dataHdrIdx + 3, 1, 6, "#,##0"),
+    numFmtRange(forecastSheetId, poolHdrIdx, poolHdrIdx + 3, 1, 4, "#,##0"),
+
+    // $#,##0 for all scenario revenue rows (cols B–D)
+    numFmtRange(forecastSheetId, fullSwIdx, viewerSwIdx + 2, 1, 4, `$#,##0`), // switch rows + total
+    numFmtRange(forecastSheetId, slExpRevIdx, plgExpRevIdx + 2, 1, 4, `$#,##0`), // expansion rows + total
+    numFmtRange(forecastSheetId, netArrIdx, netArrIdx + 1, 1, 4, `$#,##0`), // net ARR
+
+    // #,##0 for volume metrics (users)
+    numFmtRange(forecastSheetId, switchUsersIdx, totalUsersIdx + 1, 1, 4, "#,##0"),
+    // $#,##0 for implied ARR per user
+    numFmtRange(forecastSheetId, impliedRevIdx, impliedRevIdx + 1, 1, 4, `$#,##0`),
+
+    // $#,##0 for sensitivity table values (cols B–F)
+    numFmtRange(forecastSheetId, sensPriceStart, sensPriceEnd, 1, 6, `$#,##0`),
+  ];
+
+  await batchUpdateSheet(formatRequests);
+  console.log("✅ Forecast tab complete.");
 }
 
 // ── Marketing Tab ─────────────────────────────────────────────────────────
@@ -1565,7 +1958,14 @@ async function main() {
   console.log("\n✅ Insights tab done!");
 
   // ── Build Marketing tab ────────────────────────────────────────────────
+  console.log("  ⏸ Pausing 4s before Marketing tab...");
+  await sleep(4000);
   await buildMarketingTab(plgRows, slRows);
+
+  // ── Build Forecast tab ────────────────────────────────────────────────
+  console.log("  ⏸ Pausing 4s before Forecast tab...");
+  await sleep(4000);
+  await buildForecastTab(plgRows, slRows);
 
   console.log("\n✅ All done! Open your Google Sheet:");
   console.log(`   https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/edit`);
